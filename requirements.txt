@@ -1,0 +1,9 @@
+# Install PyTorch separately after confirming the NVIDIA GPU / CUDA-compatible wheel.
+qai-hub-models==0.64.0
+numpy
+opencv-python
+Pillow
+tqdm
+scikit-image
+tensorboard
+PyYAML
