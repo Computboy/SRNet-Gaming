@@ -8,4 +8,4 @@ checkpoints/**/*.pth
 checkpoints/**/*.pt
 checkpoints/**/*.tar
 outputs/
-data/gaming/
+data
