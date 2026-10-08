@@ -1,10 +1,24 @@
+import sys
+from pathlib import Path
+
 import torch
 
-from qai_hub_models.models.quicksrnetsmall.model import QuickSRNetSmall
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.trainer import build_quicksrnet_small_from_local_checkpoint
 
 SCALE = 2
 H = 128
 W = 128
+PRETRAINED = (
+    ROOT
+    / "checkpoints"
+    / "pretrained"
+    / "quicksrnet_small_2x_checkpoint_float32.pth.tar"
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -13,9 +27,11 @@ print("QuickSRNet-Small 2x smoke test")
 print("=" * 72)
 print("Device:", device)
 
-# Official Qualcomm AI Hub wrapper.
-# The first run may download the pretrained checkpoint.
-model = QuickSRNetSmall.from_pretrained(scale_factor=SCALE).to(device)
+# Use the project-local official checkpoint. This avoids a network request and
+# the global QAI cache, while retaining the same official wrapper/architecture.
+model = build_quicksrnet_small_from_local_checkpoint(
+    PRETRAINED, scale_factor=SCALE
+).to(device)
 model.eval()
 
 x = torch.rand(1, 3, H, W, device=device)

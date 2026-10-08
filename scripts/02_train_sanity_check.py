@@ -95,7 +95,7 @@ def create_demo_hr(size: int) -> Image.Image:
     rgb[ground, 2] = 78 + 10 * np.sin(70 * xxf[ground])
     noise = rng.normal(0, 2, (size, size, 1))
     arr = np.clip(rgb + noise, 0, 255).astype(np.uint8)
-    img = Image.fromarray(arr, mode="RGB")
+    img = Image.fromarray(arr)
     draw = ImageDraw.Draw(img)
 
     # House, roof, windows: edge reconstruction and geometric patterns.
@@ -136,7 +136,9 @@ def get_paired_images(args: argparse.Namespace) -> tuple[Image.Image, Image.Imag
             raise FileNotFoundError(f"HR image does not exist: {args.hr}")
         source = args.hr.resolve()
     else:
-        source = DRYRUN_HR / "sanity_source.png"
+        # This is source material, not an LR/HR pair. Keep it outside the
+        # strict paired dataset directories used by 03_finetune.py.
+        source = SAMPLES / "sanity_source.png"
         if not source.is_file():
             create_demo_hr(args.hr_size).save(source)
             print(f"Created synthetic HR source: {source}")
@@ -164,7 +166,7 @@ def pil_to_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
 
 def tensor_to_pil(x: torch.Tensor) -> Image.Image:
     array = (x.detach().clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy() * 255 + .5).astype(np.uint8)
-    return Image.fromarray(array, mode="RGB")
+    return Image.fromarray(array)
 
 
 def build_model_from_local_checkpoint(path: Path) -> QuickSRNetSmall:

@@ -1,73 +1,124 @@
 # QuickSRNet-Gaming
 
-Starter project for **Gaming-domain fine-tuning of QuickSRNet-Small (2×)**.
+面向游戏渲染场景的 **QuickSRNet-Small 2×** Fine-Tuning Pipeline。系统复用 Qualcomm 官方网络结构和预训练权重，以严格配对的真实 LR/HR 游戏帧进行全模型微调；不会修改 `qai_hub_models`，也不会在正式训练时联网下载权重。
 
-## Current phase
+## 环境与预训练权重
 
-This starter intentionally stops before formal training.
-
-The first goal is to verify, in order:
-
-1. Windows/Python environment
-2. CUDA-visible NVIDIA GPU
-3. Official QuickSRNet-Small pretrained model can be loaded
-4. 2× inference works
-5. Dry-run LR/HR image pairs can be generated
-
-Only after these checks should `Dataset`, validation metrics, and the fine-tuning loop be added.
-
-## Recommended local path
-
-`F:\CADCG\SRTP\QuickSRNet-Gaming`
-
-## Folder layout
-
-- `configs/`: experiment configuration
-- `scripts/`: executable checks and utilities
-- `src/`: reusable source code (added in the next phase)
-- `data/dryrun/`: temporary images for pipeline testing
-- `data/gaming/`: formal UE train/val/test pairs
-- `checkpoints/`: pretrained and fine-tuned weights
-- `outputs/`: logs, samples, metrics
-
-## First commands
-
-Open **Anaconda Prompt** or PowerShell:
+建议在项目 Conda 环境中运行：
 
 ```powershell
-cd F:\CADCG\SRTP\QuickSRNet-Gaming
-conda create -n qsr-gaming python=3.11 -y
 conda activate qsr-gaming
-python -m pip install --upgrade pip
-```
-
-Before installing PyTorch, run:
-
-```powershell
-nvidia-smi
-```
-
-Record the GPU model and VRAM. Then install a CUDA-enabled PyTorch build appropriate for the machine.
-
-After PyTorch is installed:
-
-```powershell
-python scripts\00_check_env.py
+cd F:\CADCG\SRTP\QuickSRNet-Gaming
+python .\scripts\00_check_env.py
 pip install -r requirements.txt
-python scripts\01_smoke_test_quicksrnet.py
 ```
 
-For a dry-run dataset, copy several images into:
+PyTorch 应根据本机 CUDA 单独安装。其余依赖见 `requirements.txt`，本阶段没有新增依赖。
 
-`data\dryrun\HR`
+把可信的官方 QuickSRNet-Small 2× checkpoint 放在：
 
-then run:
+```text
+checkpoints/pretrained/quicksrnet_small_2x_checkpoint_float32.pth.tar
+```
+
+正式入口沿用已通过 Sanity Check 的本地加载方式：创建官方 Small 2× source model，读取 checkpoint 字典中的 `state_dict`，严格加载 backbone，最后套用 `QuickSRNetSmall` 包装器。因此训练不会调用 `from_pretrained()`，也不会隐式访问网络。
+
+## 数据组织
+
+```text
+data/gaming/
+├── train/
+│   ├── LR/
+│   └── HR/
+├── val/
+│   ├── LR/
+│   └── HR/
+└── test/
+    ├── LR/
+    └── HR/
+```
+
+- 支持 PNG、JPG、JPEG；目录内可以保留相同的子目录结构。
+- LR 与 HR 优先按相对路径和文件 stem 配对，扩展名可以不同。兼容现有 Sanity Check 的 `name_lr.png` / `name_hr.png` 命名。
+- 每一对图像都必须是 RGB 可解码图像，且 HR 宽高严格等于 LR 的 2 倍。所有图像在训练启动前检查；缺对、重复 stem、损坏文件或尺寸错误都会给出明确错误。
+- 读取后转换为 RGB `[0,1]` Tensor，不使用 ImageNet mean/std，也不转到 `[-1,1]`。
+- 正式 LR 按采集结果直接读取；Dataset 不会假设或重新执行 Bicubic 下采样。
+- 训练使用同步 Random Crop、水平/垂直翻转和随机 90° 旋转；验证读取完整图像且不做随机增强。为兼容不同分辨率，默认验证 batch size 为 1。
+
+连续游戏帧必须按完整场景或序列划分 Train / Validation / Test，不能把同一序列的相邻帧随机分散到不同 split，否则会造成时序近重复数据泄漏。`data/gaming/test/` 只留给后续最终测试，不参与训练、验证或 best checkpoint 选择。
+
+## 配置
+
+统一配置在 `configs/base.yaml`：
+
+- `model`：模型名、2× scale、官方本地 checkpoint。
+- `data`：正式 Train/Validation 路径、LR patch、增强和 DataLoader 设置。
+- `training`：epoch、batch size、learning rate、Adam、L1、AMP。
+- `validation`：验证 batch、PSNR、best checkpoint 和样例输出。
+- `dryrun`：Dry Run 路径及轻量覆盖参数。
+- `output`：checkpoint、日志、CSV 指标和可视化样例的根目录。
+
+默认超参数只是可运行初值，尚未针对正式 UE 数据调优。PSNR 以 `[0,1]` RGB、每张图片独立计算后对整个验证集取平均。
+
+## 启动训练
+
+先检查模型加载和原有训练闭环：
 
 ```powershell
-python scripts\02_make_dryrun_pairs.py
+python .\scripts\01_smoke_test_quicksrnet.py
+python .\scripts\02_train_sanity_check.py
 ```
 
-## Important
+Dry Run：
 
-QuickSRNet expects RGB input values in `[0, 1]`.
-Do not use ImageNet mean/std normalization for this model.
+```powershell
+python .\scripts\03_finetune.py --config configs/base.yaml --dryrun
+```
+
+若 `data/dryrun/LR` 和 `HR` 都没有图片，入口会生成一对确定性的合成图。若只有一边有图片，则不会偷偷补数据，而会报告缺失配对。Dry Run 复用训练图片进行验证，仅用于检查数据、反向传播、保存和恢复链路。其 checkpoint 命名为 `best_self_check.pth`，不会被误认为独立验证集上的 `best.pth`。
+
+正式 Fine-Tuning：
+
+```powershell
+python .\scripts\03_finetune.py --config configs/base.yaml
+```
+
+正式模式只读取配置指定的 `data/gaming/train` 和 `data/gaming/val`。任一目录缺失、为空或存在坏数据都会直接失败，绝不会回退到 Dry Run；test split 不会被读取。
+
+可用 `--device cpu|cuda|auto`、`--epochs N` 和 `--experiment-name NAME` 做少量命令行覆盖。
+
+## 输出与 Resume
+
+每次新运行使用独立实验子目录，避免覆盖旧结果：
+
+```text
+checkpoints/finetuned/<run>/
+├── last.pth
+└── best.pth                 # 正式模式：独立验证集最优
+outputs/logs/<run>/train.log
+outputs/metrics/<run>/metrics.csv
+outputs/samples/<run>/latest_validation_sample.png
+```
+
+Dry Run 会以 `best_self_check.pth` 代替 `best.pth`，明确表示该指标来自训练配对自检。
+
+训练 checkpoint 包含 backbone 权重、Optimizer、AMP scaler、已完成 epoch、完整配置、历史指标、当前 best PSNR、运行名和验证集是否独立的标记。`last.pth` 每个 epoch 更新；正式模式按 validation PSNR 保存 `best.pth`。这些文件不会覆盖已有的 `sanity_check.pth`。
+
+从 `last.pth` 继续时，总 epoch 必须大于 checkpoint 中已完成的 epoch：
+
+```powershell
+python .\scripts\03_finetune.py --config configs/base.yaml `
+  --resume checkpoints/finetuned/<run>/last.pth --epochs 60
+```
+
+恢复后会加载模型参数、Optimizer、AMP scaler、epoch、历史指标和 best 指标，并继续写入同一 run 子目录。每次训练结束还会新建模型实例、重新加载 `last.pth`，用验证样本检查推理输出与保存前完全一致（容差 `1e-6`）。
+
+## 测试
+
+Dataset 的标准库单元测试不需要额外测试框架：
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+测试覆盖正常配对、现有 `_lr`/`_hr` 兼容命名、缺失配对、损坏图像、非严格 2× 尺寸以及同步裁剪后的 Tensor shape。

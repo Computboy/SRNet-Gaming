@@ -8,4 +8,7 @@ checkpoints/**/*.pth
 checkpoints/**/*.pt
 checkpoints/**/*.tar
 outputs/
-data
+data/gaming/
+data/dryrun/**/*.png
+data/dryrun/**/*.jpg
+data/dryrun/**/*.jpeg
