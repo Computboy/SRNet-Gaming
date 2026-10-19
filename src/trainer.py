@@ -209,6 +209,15 @@ class Trainer:
         if epoch < 0:
             raise ValueError(f"Resume checkpoint has invalid epoch {epoch}: {path}")
         self.logger.info("Resumed model, optimizer, and epoch %d from %s", epoch, path)
+        self.logger.info(
+            "Resume state | Adam parameter states: %d | learning rates: %s | "
+            "history rows: %d | global best validation PSNR: %.6f dB | AMP scale: %.0f",
+            len(self.optimizer.state),
+            [group["lr"] for group in self.optimizer.param_groups],
+            len(self.history),
+            self.best_val_psnr,
+            self.scaler.get_scale(),
+        )
         return epoch
 
     def _check_output(self, output: torch.Tensor, target: torch.Tensor, context: str) -> None:
@@ -256,6 +265,11 @@ class Trainer:
             batch_size = lr.shape[0]
             total_loss += loss.detach().item() * batch_size
             total_images += batch_size
+            if batch_index == 1 or batch_index % 20 == 0:
+                self.logger.info(
+                    "Epoch %d training | batch %d | images %d | mean L1 %.6f",
+                    epoch, batch_index, total_images, total_loss / total_images,
+                )
 
         if total_images == 0:
             raise RuntimeError("Training DataLoader produced no batches")
@@ -282,6 +296,11 @@ class Trainer:
                 total_l1 += per_image_l1.sum().item()
                 total_psnr += per_image_psnr.sum().item()
                 total_images += lr.shape[0]
+                if batch_index == 1 or batch_index % 60 == 0:
+                    self.logger.info(
+                        "Epoch %d validation | images %d | mean PSNR %.3f dB",
+                        epoch, total_images, total_psnr / total_images,
+                    )
         if total_images == 0:
             raise RuntimeError("Validation DataLoader produced no batches")
         return total_l1 / total_images, total_psnr / total_images

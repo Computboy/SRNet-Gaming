@@ -7,6 +7,7 @@ __pycache__/
 checkpoints/**/*.pth
 checkpoints/**/*.pt
 checkpoints/**/*.tar
+checkpoints/**/archive_epoch*/
 outputs/
 data/gaming/
 data/dryrun/**/*.png

@@ -192,6 +192,7 @@ def run(args: argparse.Namespace) -> None:
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
         worker_init_fn=seed_worker,
         generator=generator,
     )
@@ -201,6 +202,7 @@ def run(args: argparse.Namespace) -> None:
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
         worker_init_fn=seed_worker,
     )
 

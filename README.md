@@ -2,6 +2,8 @@
 
 面向游戏渲染场景的 **QuickSRNet-Small 2×** Fine-Tuning Pipeline。系统复用 Qualcomm 官方网络结构和预训练权重，以严格配对的真实 LR/HR 游戏帧进行全模型微调；不会修改 `qai_hub_models`，也不会在正式训练时联网下载权重。
 
+完整的中文解释、阶段输入输出、张量尺寸及本次实验结果见 [微调管线指南](docs/finetuning_pipeline_guide_zh.md)。
+
 ## 环境与预训练权重
 
 建议在项目 Conda 环境中运行：
@@ -13,7 +15,7 @@ python .\scripts\00_check_env.py
 pip install -r requirements.txt
 ```
 
-PyTorch 应根据本机 CUDA 单独安装。其余依赖见 `requirements.txt`，本阶段没有新增依赖。
+PyTorch 应根据本机 CUDA 单独安装。其余依赖及曲线绘图所需的 Matplotlib 见 `requirements.txt`。
 
 把可信的官方 QuickSRNet-Small 2× checkpoint 放在：
 
@@ -112,6 +114,20 @@ python .\scripts\03_finetune.py --config configs/base.yaml `
 ```
 
 恢复后会加载模型参数、Optimizer、AMP scaler、epoch、历史指标和 best 指标，并继续写入同一 run 子目录。每次训练结束还会新建模型实例、重新加载 `last.pth`，用验证样本检查推理输出与保存前完全一致（容差 `1e-6`）。
+
+当前训练使用固定学习率，没有启用学习率调度器。Resume 会恢复 checkpoint 中 Adam 的学习率、一阶/二阶矩和更新计数；历史最高 validation PSNR 也会恢复，`best.pth` 只有在分数严格超过历史最高值时才更新。
+
+## 训练曲线
+
+从已保存的逐轮 CSV 导出 Train Loss、Validation PSNR、后期 PSNR 放大图和收敛分析：
+
+```powershell
+python .\scripts\04_plot_training_curves.py `
+  --metrics outputs/metrics/<run>/metrics.csv `
+  --output-dir outputs/analysis/<run>/epoch001-050 --end-epoch 50
+```
+
+输出包括组合曲线 PNG/SVG、两张独立曲线 PNG、指定轮数的指标快照、JSON 统计和 `analysis.md`。Train Loss 同时展示原始值与 5 轮移动平均；Validation PSNR 按全分辨率 RGB 图像逐帧计算后取平均。设置 `--end-epoch 100` 可生成续训后的完整曲线和 Epoch 50→100 增量。
 
 ## 测试
 
