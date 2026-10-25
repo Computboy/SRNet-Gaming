@@ -14,6 +14,8 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 
+from src.metrics import rgb_psnr_per_image
+
 from qai_hub_models.models.quicksrnetsmall.model import (
     QuickSRNetSmall,
     _load_quicksrnet_source_model,
@@ -287,12 +289,7 @@ class Trainer:
                 output = self.model(lr)
                 self._check_output(output, hr, f"validation epoch {epoch}, batch {batch_index}")
                 per_image_l1 = torch.mean(torch.abs(output - hr), dim=(1, 2, 3))
-                per_image_mse = torch.mean((output.clamp(0.0, 1.0) - hr) ** 2, dim=(1, 2, 3))
-                per_image_psnr = torch.where(
-                    per_image_mse == 0,
-                    torch.full_like(per_image_mse, float("inf")),
-                    -10.0 * torch.log10(per_image_mse),
-                )
+                per_image_psnr = rgb_psnr_per_image(output, hr)
                 total_l1 += per_image_l1.sum().item()
                 total_psnr += per_image_psnr.sum().item()
                 total_images += lr.shape[0]
