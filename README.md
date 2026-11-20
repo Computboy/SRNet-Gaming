@@ -1,10 +1,16 @@
 # QuickSRNet-Gaming
 
-面向游戏渲染场景的 **QuickSRNet-Small 2×** Fine-Tuning Pipeline。系统复用 Qualcomm 官方网络结构和预训练权重，以严格配对的真实 LR/HR 游戏帧进行全模型微调；不会修改 `qai_hub_models`，也不会在正式训练时联网下载权重。
+面向游戏渲染场景的 **QuickSRNet-Small / Medium 2×** Fine-Tuning Pipeline。系统复用 Qualcomm 官方网络结构和预训练权重，以严格配对的真实 LR/HR 游戏帧进行全模型微调；不会修改 `qai_hub_models`，也不会在正式训练时联网下载权重。
 
 完整的中文解释、阶段输入输出、张量尺寸及本次实验结果见 [微调管线指南](docs/finetuning_pipeline_guide_zh.md)。
 
+边缘评价与选模对照使用 `configs/asian_village_selection.yaml`：保持 L1 训练不变，在验证时记录固定 HR 边缘区域的 PSNR，并同时保存最高 PSNR、加权评分与 PSNR 约束下边缘优先三种选择。配置默认在选模完成后计算 SSIM，SSIM 不参与模型选择。
+
+严格 A/B 运行使用 `configs/asian_village_edge_l1.yaml` 新增可选 HR 区域 Edge-L1，默认 λ=0.1；执行器串行运行 L1 基线与 Edge-L1 实验，并生成验证对照。另提供 λ=0.5 和 Medium 容量消融配置。
+
 ## 环境与预训练权重
+
+容量消融使用 **QuickSRNet-Medium f32-m5 + L1**，通过 `configs/asian_village_medium_l1.yaml` 保持与 Small 基线相同的数据、优化器和验证协议。
 
 建议在项目 Conda 环境中运行：
 
@@ -17,13 +23,14 @@ pip install -r requirements.txt
 
 PyTorch 应根据本机 CUDA 单独安装。其余依赖及曲线绘图所需的 Matplotlib 见 `requirements.txt`。
 
-把可信的官方 QuickSRNet-Small 2× checkpoint 放在：
+把可信的官方 QuickSRNet-Small / Medium 2× checkpoint 放在：
 
 ```text
 checkpoints/pretrained/quicksrnet_small_2x_checkpoint_float32.pth.tar
+checkpoints/pretrained/quicksrnet_medium_2x_checkpoint_float32.pth.tar
 ```
 
-正式入口沿用已通过 Sanity Check 的本地加载方式：创建官方 Small 2× source model，读取 checkpoint 字典中的 `state_dict`，严格加载 backbone，最后套用 `QuickSRNetSmall` 包装器。因此训练不会调用 `from_pretrained()`，也不会隐式访问网络。
+正式入口创建配置对应的官方 Small / Medium 2× source model，读取 checkpoint 字典中的 `state_dict`，严格加载 backbone，最后套用对应包装器。因此训练不会调用 `from_pretrained()`，也不会隐式访问网络。
 
 ## 数据组织
 
@@ -128,6 +135,17 @@ python .\scripts\04_plot_training_curves.py `
 ```
 
 输出包括组合曲线 PNG/SVG、两张独立曲线 PNG、指定轮数的指标快照、JSON 统计和 `analysis.md`。Train Loss 同时展示原始值与 5 轮移动平均；Validation PSNR 按全分辨率 RGB 图像逐帧计算后取平均。设置 `--end-epoch 100` 可生成续训后的完整曲线和 Epoch 50→100 增量。
+
+## 对比实验脚本
+
+以下脚本保留实验流程；权重、数据、结果图、指标报告和论文 PDF 均保存在本地。首次复现需自行准备对应数据与官方权重。运行各脚本的 `--help` 可查看完整参数。
+
+- `08_check_edge_region_metrics.py`、`09_plot_selection_comparison.py`：边缘指标诊断与选模对比。
+- `10_run_edge_l1_ab.py`、`11_compare_edge_l1_ab.py`、`12_edge_l1_status.py`：串行 A/B 执行、验证分析与状态查询。
+- `13_prepare_medium_l1.py`、`14_run_medium_l1.py`、`15_compare_capacity.py`：Medium 准备检查、训练与容量对比；正式训练需显式传入 `--start-training`。
+- `16_make_medium_roi_gallery.py`、`17_summarize_edge_l1_experiments.py`、`18_render_paper_figures.py`：生成局部对比、汇总和论文图表，依赖已完成实验的本地产物与约定运行名。
+
+脚本位于 `scripts/`。训练和验证选模不读取 Test；论文图表脚本可在选模后使用 Test 生成对比图。生成文件写入被 Git 忽略的 `outputs/`；临时渲染文件写入 `tmp/` 时也会被忽略。
 
 ## 测试
 
