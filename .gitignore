@@ -4,12 +4,21 @@ __pycache__/
 .env/
 .idea/
 .vscode/
-checkpoints/**/*.pth
-checkpoints/**/*.pt
-checkpoints/**/*.tar
-checkpoints/**/archive_epoch*/
+# Local weights, provenance and generated experiment artifacts.
+/checkpoints/
 outputs/
+/tmp/
+*.pdf
 data/gaming/
 data/dryrun/**/*.png
 data/dryrun/**/*.jpg
 data/dryrun/**/*.jpeg
+
+# Local experiment reports and manuscript drafts (keep workflow code/configs).
+/docs/edge_l1_pause_20261026_zh.md
+/docs/edge_l1_stage2_zh.md
+/docs/edge_selection_stage1_zh.md
+/docs/finetuning_chapters_3_4_zh.md
+/docs/medium_l1_preparation_zh.md
+/docs/medium_l1_recovery_20261026_zh.md
+/docs/ssim_post_selection_zh.md
