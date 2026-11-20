@@ -1,0 +1,59 @@
+project:
+  name: QuickSRNet-Gaming-Medium-L1-150
+  scale_factor: 2
+model:
+  name: quicksrnet_medium
+  scale_factor: 2
+  pretrained_checkpoint: checkpoints/pretrained/quicksrnet_medium_2x_checkpoint_float32.pth.tar
+  pretrained_sha256: a0d176b40a649e45a176c3b53f45e0237015f4f2c17b157ef5c81e38c4442a0d
+data:
+  train_lr: data/gaming/train/LR
+  train_hr: data/gaming/train/HR
+  val_lr: data/gaming/val/LR
+  val_hr: data/gaming/val/HR
+  scale_factor: 2
+  lr_patch_size: 128
+  rgb_range:
+  - 0.0
+  - 1.0
+  augment: true
+  num_workers: 4
+  pin_memory: true
+training:
+  epochs: 150
+  batch_size: 16
+  learning_rate: 0.0001
+  optimizer: adam
+  loss: l1
+  edge_l1_weight: 0.0
+  amp: true
+validation:
+  ssim_schedule: post_selection
+  batch_size: 1
+  metric: psnr
+  save_best: true
+  save_samples: true
+  edge_evaluation:
+    enabled: true
+    sobel_threshold: 0.05
+    dilation_radius: 1
+    weighted_alpha: 0.3
+    psnr_tolerance_db: 0.1
+dryrun:
+  lr: data/dryrun/LR
+  hr: data/dryrun/HR
+  epochs: 3
+  batch_size: 1
+  lr_patch_size: 64
+  augment: true
+output:
+  checkpoint_dir: checkpoints/finetuned
+  log_dir: outputs/logs
+  metric_dir: outputs/metrics
+  sample_dir: outputs/samples
+device: cuda
+seed: 42
+experiment:
+  run_name: asian-village-medium-l1-150-001
+  parent_run: asian-village-medium-l1-001
+  parent_epoch: 100
