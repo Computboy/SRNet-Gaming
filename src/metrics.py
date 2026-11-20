@@ -17,6 +17,22 @@ SSIM_PARAMETERS = {
 }
 
 
+def ssim_schedule_from_config(config: dict) -> str:
+    """SSIM is diagnostic only; legacy runs computed it during each epoch."""
+    schedule = config.get("validation", {}).get("ssim_schedule", "per_epoch")
+    if not isinstance(schedule, str) or schedule not in {"per_epoch", "post_selection"}:
+        raise ValueError("validation.ssim_schedule must be per_epoch or post_selection")
+    return schedule
+
+
+def selection_validation_settings(config: dict) -> dict:
+    """Allow a reporting schedule revision without relaxing selection checks."""
+    ssim_schedule_from_config(config)
+    settings = dict(config.get("validation", {}))
+    settings.pop("ssim_schedule", None)
+    return settings
+
+
 def rgb_psnr_per_image(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Original Trainer.validate formula, returning one PSNR per BCHW image.
 

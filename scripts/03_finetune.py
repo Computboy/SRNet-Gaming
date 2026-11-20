@@ -1,4 +1,4 @@
-"""Formal QuickSRNet-Small 2x fine-tuning entry point.
+r"""Formal QuickSRNet Small/Medium 2x fine-tuning entry point.
 
 Examples (run from the repository root):
     python .\scripts\03_finetune.py --config configs/base.yaml
@@ -10,11 +10,14 @@ Examples (run from the repository root):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 from torch.utils.data import DataLoader
 
 
@@ -23,10 +26,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.dataset import PairedImageDataset  # noqa: E402
+from src.edge_validation import EdgeValidationProtocol  # noqa: E402
+from src.losses import TrainingLossProtocol  # noqa: E402
 from src.trainer import (  # noqa: E402
     Trainer,
     build_optimizer,
-    build_quicksrnet_small_from_local_checkpoint,
+    build_quicksrnet_from_local_checkpoint,
     read_training_checkpoint_metadata,
     resolve_device,
     verify_checkpoint_reload,
@@ -44,7 +49,7 @@ from src.utils import (  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Fine-tune QuickSRNet-Small 2x on paired images")
+    parser = argparse.ArgumentParser(description="Fine-tune QuickSRNet Small/Medium 2x on paired images")
     parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"))
     parser.add_argument(
         "--dryrun",
@@ -92,6 +97,29 @@ def _select_run_name(
     return candidate
 
 
+def _check_output_directories(paths: list[Path], resume_path: Path | None) -> None:
+    if resume_path is None:
+        occupied = [str(path) for path in paths if path.exists()]
+        if occupied:
+            raise ValueError(f"Output run already exists; choose a new --experiment-name: {occupied}")
+    elif (paths[0] / "last.pth").is_file():
+        latest = read_training_checkpoint_metadata(paths[0] / "last.pth")
+        requested = read_training_checkpoint_metadata(resume_path)
+        if latest.get("run_name") != requested.get("run_name"):
+            raise ValueError("Resume checkpoint belongs to a different existing output run")
+        if int(latest["epoch"]) > int(requested["epoch"]):
+            raise ValueError("Resume checkpoint is older than this run's last.pth; refusing to overwrite newer results")
+
+
+def _validation_manifest(dataset: PairedImageDataset) -> dict[str, Any]:
+    pairs = [{"key": pair.key,
+              "lr_sha256": hashlib.sha256(pair.lr_path.read_bytes()).hexdigest(),
+              "hr_sha256": hashlib.sha256(pair.hr_path.read_bytes()).hexdigest()}
+             for pair in dataset.pairs]
+    digest = hashlib.sha256(json.dumps(pairs, sort_keys=True).encode("utf-8")).hexdigest()
+    return {"sha256": digest, "pairs": pairs}
+
+
 def run(args: argparse.Namespace) -> None:
     config_path = project_path(ROOT, args.config)
     config = load_yaml_config(config_path)
@@ -102,8 +130,8 @@ def run(args: argparse.Namespace) -> None:
     output_cfg = require_mapping(config, "output")
 
     model_name = str(model_cfg.get("name", ""))
-    if model_name.casefold() != "quicksrnet_small":
-        raise ValueError(f"Only model.name=quicksrnet_small is supported, got '{model_name}'")
+    if model_name.casefold() not in {"quicksrnet_small", "quicksrnet_medium"}:
+        raise ValueError(f"Unsupported model.name: '{model_name}'")
     scale_factor = _positive_int(model_cfg.get("scale_factor", 2), "model.scale_factor")
     data_scale = _positive_int(data_cfg.get("scale_factor", scale_factor), "data.scale_factor")
     if data_scale != scale_factor:
@@ -120,19 +148,26 @@ def run(args: argparse.Namespace) -> None:
             )
     if list(data_cfg.get("rgb_range", [0.0, 1.0])) != [0.0, 1.0]:
         raise ValueError("data.rgb_range must be [0.0, 1.0] for QuickSRNet")
-    if str(training_cfg.get("loss", "l1")).casefold() != "l1":
-        raise ValueError("Only training.loss=l1 is currently supported")
+    loss_protocol = TrainingLossProtocol.from_config(config)
     if str(validation_cfg.get("metric", "psnr")).casefold() != "psnr":
         raise ValueError("Only validation.metric=psnr is currently supported")
+    edge_protocol = EdgeValidationProtocol.from_config(config)
 
     seed = _positive_int(config.get("seed", 42), "seed", allow_zero=True)
     seed_everything(seed)
     requested_device = args.device or str(config.get("device", "auto"))
     device = resolve_device(requested_device)
     pretrained = project_path(ROOT, model_cfg["pretrained_checkpoint"])
+    if model_cfg.get("pretrained_sha256") and hashlib.sha256(pretrained.read_bytes()).hexdigest() != model_cfg["pretrained_sha256"]:
+        raise ValueError("Official pretrained checkpoint SHA256 does not match the declared configuration")
 
     resume_path = project_path(ROOT, args.resume) if args.resume is not None else None
     run_name = _select_run_name(args, resume_path, args.dryrun)
+    checkpoint_dir = project_path(ROOT, output_cfg["checkpoint_dir"]) / run_name
+    log_dir = project_path(ROOT, output_cfg["log_dir"]) / run_name
+    metric_dir = project_path(ROOT, output_cfg["metric_dir"]) / run_name
+    sample_dir = project_path(ROOT, output_cfg["sample_dir"]) / run_name
+    _check_output_directories([checkpoint_dir, log_dir, metric_dir, sample_dir], resume_path)
 
     if args.dryrun:
         dryrun_cfg = require_mapping(config, "dryrun")
@@ -181,6 +216,7 @@ def run(args: argparse.Namespace) -> None:
         lr_patch_size=None,
         augment=False,
     )
+    validation_manifest = _validation_manifest(val_dataset) if edge_protocol.enabled else None
 
     num_workers = _positive_int(data_cfg.get("num_workers", 0), "data.num_workers", allow_zero=True)
     val_batch_size = _positive_int(validation_cfg.get("batch_size", 1), "validation.batch_size")
@@ -206,10 +242,6 @@ def run(args: argparse.Namespace) -> None:
         worker_init_fn=seed_worker,
     )
 
-    checkpoint_dir = project_path(ROOT, output_cfg["checkpoint_dir"]) / run_name
-    log_dir = project_path(ROOT, output_cfg["log_dir"]) / run_name
-    metric_dir = project_path(ROOT, output_cfg["metric_dir"]) / run_name
-    sample_dir = project_path(ROOT, output_cfg["sample_dir"]) / run_name
     logger = create_logger(f"quicksrnet.{run_name}", log_dir / "train.log")
     logger.info("Configuration: %s", config_path)
     logger.info("Run: %s | mode: %s | device: %s", run_name, "dry-run" if args.dryrun else "formal", device)
@@ -222,7 +254,7 @@ def run(args: argparse.Namespace) -> None:
             "not independent validation or evidence of generalization."
         )
 
-    model = build_quicksrnet_small_from_local_checkpoint(pretrained, scale_factor=scale_factor)
+    model = build_quicksrnet_from_local_checkpoint(pretrained, model_name=model_name, scale_factor=scale_factor)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     logger.info(
@@ -254,8 +286,25 @@ def run(args: argparse.Namespace) -> None:
         save_best=save_best,
         amp=bool(training_cfg.get("amp", False)),
         save_samples=bool(validation_cfg.get("save_samples", True)),
+        validation_fingerprint=validation_manifest["sha256"] if validation_manifest else None,
     )
     start_epoch = trainer.resume(resume_path) if resume_path is not None else 0
+    config["runtime"] = {
+        "source_config": str(config_path), "run_name": run_name, "dryrun": args.dryrun,
+        "total_epochs": epochs, "train_batch_size": batch_size, "lr_patch_size": lr_patch_size,
+        "augment": augment, "device": str(device), "train_pairs": len(train_dataset),
+        "val_pairs": len(val_dataset), "train_lr": str(train_lr_dir), "train_hr": str(train_hr_dir),
+        "val_lr": str(val_lr_dir), "val_hr": str(val_hr_dir), "resumed_from_epoch": start_epoch,
+        "pretrained_checkpoint_sha256": hashlib.sha256(pretrained.read_bytes()).hexdigest(),
+        "torch_version": str(torch.__version__),
+        "cuda_device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+    }
+    snapshot_name = "resolved_config.yaml" if resume_path is None else f"resumed_from_epoch{start_epoch:03d}.yaml"
+    (log_dir / snapshot_name).write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    if edge_protocol.enabled:
+        logger.info("Frozen edge-validation protocol: %s", edge_protocol.definition())
+        (log_dir / "validation_manifest.json").write_text(json.dumps(validation_manifest, indent=2), encoding="utf-8")
+    logger.info("Frozen training loss protocol: %s", loss_protocol.definition(edge_protocol))
     last_checkpoint = trainer.fit(train_loader, val_loader, start_epoch=start_epoch)
 
     verification_batch = next(iter(val_loader))
@@ -271,6 +320,8 @@ def run(args: argparse.Namespace) -> None:
     logger.info("Training complete. Last checkpoint: %s", last_checkpoint)
     if validation_is_independent and save_best:
         logger.info("Best validation checkpoint: %s", checkpoint_dir / "best.pth")
+        if edge_protocol.enabled:
+            logger.info("Selection comparison: %s", metric_dir / "selection_summary.json")
     elif not validation_is_independent and save_best:
         logger.warning(
             "Dry run complete: best_self_check.pth is deliberately not named best.pth because "

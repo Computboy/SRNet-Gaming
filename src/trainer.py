@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import math
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -14,12 +16,17 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader
 
-from src.metrics import rgb_psnr_per_image
+from src.metrics import rgb_psnr_per_image, rgb_ssim, ssim_schedule_from_config, selection_validation_settings
+from src.edge_validation import (
+    EdgeRegionMetric, EdgeValidationProtocol, json_safe, select_epochs, weighted_score,
+)
+from src.losses import EdgeAwareL1, TrainingLossProtocol
 
 from qai_hub_models.models.quicksrnetsmall.model import (
     QuickSRNetSmall,
     _load_quicksrnet_source_model,
 )
+from qai_hub_models.models.quicksrnetmedium.model import QuickSRNetMedium
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -47,7 +54,23 @@ def build_quicksrnet_small_from_local_checkpoint(
     *,
     scale_factor: int = 2,
 ) -> QuickSRNetSmall:
-    """Build the official Small architecture without downloading any asset.
+    """Backward-compatible Small factory used by the completed A/B tools."""
+    return build_quicksrnet_from_local_checkpoint(checkpoint_path, model_name="quicksrnet_small", scale_factor=scale_factor)
+
+
+MODEL_VARIANTS = {
+    "quicksrnet_small": (QuickSRNetSmall, 32, 2),
+    "quicksrnet_medium": (QuickSRNetMedium, 32, 5),
+}
+
+
+def build_quicksrnet_from_local_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    model_name: str = "quicksrnet_small",
+    scale_factor: int = 2,
+) -> torch.nn.Module:
+    """Build an official Small/Medium architecture and strictly load local weights.
 
     This intentionally mirrors the loading path already verified by
     ``02_train_sanity_check.py``. The checkpoint must be the trusted official
@@ -55,17 +78,21 @@ def build_quicksrnet_small_from_local_checkpoint(
     """
 
     path = Path(checkpoint_path).resolve()
+    model_name = model_name.casefold()
+    if model_name not in MODEL_VARIANTS:
+        raise ValueError(f"Unsupported QuickSRNet variant: {model_name}")
+    wrapper, channels, intermediate_layers = MODEL_VARIANTS[model_name]
     if scale_factor != 2:
         raise ValueError(
-            f"This pipeline is intentionally limited to QuickSRNet-Small 2x, got {scale_factor}x"
+            f"This pipeline is intentionally limited to QuickSRNet 2x, got {scale_factor}x"
         )
     if not path.is_file():
         raise FileNotFoundError(
             f"Official pretrained checkpoint not found: {path}. Copy the Qualcomm "
-            "QuickSRNet-Small 2x .pth.tar file into checkpoints/pretrained/."
+            f"{model_name} 2x .pth.tar file into checkpoints/pretrained/."
         )
 
-    backbone = _load_quicksrnet_source_model(scale_factor, 32, 2, False)
+    backbone = _load_quicksrnet_source_model(scale_factor, channels, intermediate_layers, False)
     checkpoint = _load_torch_file(path, trusted=True)
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError(
@@ -75,9 +102,9 @@ def build_quicksrnet_small_from_local_checkpoint(
         backbone.load_state_dict(checkpoint["state_dict"], strict=True)
     except RuntimeError as exc:
         raise ValueError(
-            f"Checkpoint weights are incompatible with QuickSRNet-Small 2x: {path}\n{exc}"
+            f"Checkpoint weights are incompatible with {model_name} 2x: {path}\n{exc}"
         ) from exc
-    model = QuickSRNetSmall(backbone, scale_factor)
+    model = wrapper(backbone, scale_factor)
     model.requires_grad_(True)
     return model
 
@@ -93,7 +120,7 @@ def build_optimizer(model: torch.nn.Module, name: str, learning_rate: float) -> 
 def _backbone(model: torch.nn.Module) -> torch.nn.Module:
     inner = getattr(model, "model", None)
     if not isinstance(inner, torch.nn.Module):
-        raise TypeError("Expected the official QuickSRNetSmall wrapper with a '.model' backbone")
+        raise TypeError("Expected an official QuickSRNet wrapper with a '.model' backbone")
     return inner
 
 
@@ -130,6 +157,14 @@ class Trainer:
         "epoch_seconds",
         "validation_scope",
     )
+    EDGE_CSV_FIELDS = (
+        "val_ssim", "val_edge_region_psnr_db", "val_edge_images",
+        "val_edge_coverage", "val_weighted_score", "resumed_from_epoch", "val_ssim_status",
+    )
+    LOSS_CSV_FIELDS = (
+        "train_global_l1", "train_edge_l1", "train_total_loss",
+        "train_edge_coverage", "train_edge_empty_masks",
+    )
 
     def __init__(
         self,
@@ -150,6 +185,7 @@ class Trainer:
         save_best: bool = True,
         amp: bool = False,
         save_samples: bool = True,
+        validation_fingerprint: str | None = None,
     ) -> None:
         if epochs < 1:
             raise ValueError(f"epochs must be >= 1, got {epochs}")
@@ -169,6 +205,21 @@ class Trainer:
         self.save_best = save_best
         self.save_samples = save_samples
         self.best_val_psnr = -math.inf
+        self.edge_protocol = EdgeValidationProtocol.from_config(config)
+        self.ssim_schedule = ssim_schedule_from_config(config)
+        self.logger.info("SSIM schedule: %s (does not participate in checkpoint selection)", self.ssim_schedule)
+        if self.edge_protocol.enabled and not self.save_best:
+            raise ValueError("Edge selection comparison requires validation.save_best=true")
+        self.edge_metric = EdgeRegionMetric(self.edge_protocol).to(device) if self.edge_protocol.enabled else None
+        self.loss_protocol = TrainingLossProtocol.from_config(config)
+        loss_mask = self.edge_metric
+        if loss_mask is None and self.loss_protocol.mode == "l1_edge":
+            loss_mask = EdgeRegionMetric(self.edge_protocol).to(device)
+        self.loss_function = EdgeAwareL1(self.loss_protocol, loss_mask).to(device)
+        self.record_loss_components = self.edge_protocol.enabled or self.loss_protocol.mode == "l1_edge"
+        self.last_train_components: dict[str, Any] = {}
+        self.last_validation_details: dict[str, Any] = {}
+        self.validation_fingerprint = validation_fingerprint
         self.history: list[dict[str, Any]] = []
         self.amp_enabled = bool(amp and device.type == "cuda")
         try:
@@ -189,11 +240,36 @@ class Trainer:
             missing = sorted(required - set(checkpoint if isinstance(checkpoint, dict) else {}))
             raise ValueError(f"Invalid training checkpoint {path}; missing keys: {missing}")
         checkpoint_scale = int(checkpoint.get("scale_factor", self.scale_factor))
+        saved_model_name = checkpoint.get("config", {}).get("model", {}).get("name", "quicksrnet_small")
+        if saved_model_name != self.config.get("model", {}).get("name", "quicksrnet_small"):
+            raise ValueError("Cannot resume a checkpoint from a different QuickSRNet model variant")
         if checkpoint_scale != self.scale_factor:
             raise ValueError(
                 f"Resume checkpoint is {checkpoint_scale}x, but configuration is "
                 f"{self.scale_factor}x: {path}"
             )
+        expected_protocol = self.edge_protocol.definition() if self.edge_protocol.enabled else None
+        if checkpoint.get("edge_validation_protocol") != expected_protocol:
+            raise ValueError(
+                "Cannot change the edge validation/selection protocol during resume. "
+                "Start a new run from the official pretrained weights instead."
+            )
+        if self.edge_protocol.enabled and checkpoint.get("validation_fingerprint") != self.validation_fingerprint:
+            raise ValueError("Validation image contents changed since checkpoint creation; start a new run")
+        if selection_validation_settings(checkpoint.get("config", {})) != selection_validation_settings(self.config):
+            raise ValueError("Cannot change validation settings other than the SSIM reporting schedule during resume")
+        old_schedule = ssim_schedule_from_config(checkpoint.get("config", {}))
+        if old_schedule != self.ssim_schedule:
+            self.logger.info("SSIM reporting schedule revision on resume: %s -> %s", old_schedule, self.ssim_schedule)
+        saved_loss = checkpoint.get("training_loss_protocol")
+        if saved_loss is None:
+            # Legacy checkpoints used global L1 only. Derive its explicit protocol.
+            old_config = checkpoint.get("config", {})
+            saved_loss = TrainingLossProtocol.from_config(old_config).definition(
+                EdgeValidationProtocol.from_config(old_config)
+            )
+        if saved_loss != self.loss_protocol.definition(self.edge_protocol):
+            raise ValueError("Cannot change training Loss mode, edge weight or mask protocol during resume")
         try:
             _backbone(self.model).load_state_dict(checkpoint["state_dict"], strict=True)
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -207,6 +283,9 @@ class Trainer:
         history = checkpoint.get("metrics", [])
         if isinstance(history, list):
             self.history = history
+            if self.edge_protocol.enabled:
+                for row in self.history:
+                    row.setdefault("val_ssim_status", "per_epoch" if row.get("val_ssim") is not None else "deferred_post_selection")
         epoch = int(checkpoint["epoch"])
         if epoch < 0:
             raise ValueError(f"Resume checkpoint has invalid epoch {epoch}: {path}")
@@ -237,6 +316,8 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         total_images = 0
+        component_sums = {"global_l1": 0.0, "edge_l1": 0.0, "edge_coverage": 0.0}
+        empty_masks = 0
         for batch_index, batch in enumerate(loader, start=1):
             lr = batch["lr"].to(self.device, non_blocking=True)
             hr = batch["hr"].to(self.device, non_blocking=True)
@@ -248,7 +329,8 @@ class Trainer:
             ):
                 output = self.model(lr)
                 self._check_output(output, hr, f"epoch {epoch}, batch {batch_index}")
-                loss = torch.nn.functional.l1_loss(output, hr)
+                components = self.loss_function(output, hr)
+                loss = components["total_loss"]
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"Non-finite training loss at epoch {epoch}, batch {batch_index}: "
@@ -260,21 +342,40 @@ class Trainer:
             if not gradients:
                 raise RuntimeError("No gradients were produced; model parameters may be frozen")
             if not all(torch.isfinite(gradient).all() for gradient in gradients):
-                raise RuntimeError(f"Gradient contains NaN/Inf at epoch {epoch}, batch {batch_index}")
+                if not self.amp_enabled:
+                    raise RuntimeError(f"Gradient contains NaN/Inf at epoch {epoch}, batch {batch_index}")
+                self.logger.warning(
+                    "AMP gradient overflow at epoch %d, batch %d: GradScaler will skip the update and lower the loss scale",
+                    epoch,
+                    batch_index,
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             batch_size = lr.shape[0]
             total_loss += loss.detach().item() * batch_size
             total_images += batch_size
+            if self.record_loss_components:
+                for name in component_sums:
+                    component_sums[name] += components[name].detach().item() * batch_size
+                empty_masks += components["empty_masks"].item()
             if batch_index == 1 or batch_index % 20 == 0:
                 self.logger.info(
-                    "Epoch %d training | batch %d | images %d | mean L1 %.6f",
+                    "Epoch %d training | batch %d | images %d | mean total loss %.6f",
                     epoch, batch_index, total_images, total_loss / total_images,
                 )
 
         if total_images == 0:
             raise RuntimeError("Training DataLoader produced no batches")
+        if self.record_loss_components:
+            self.last_train_components = {
+                "train_global_l1": component_sums["global_l1"] / total_images,
+                "train_edge_l1": component_sums["edge_l1"] / total_images,
+                "train_total_loss": total_loss / total_images,
+                "train_edge_coverage": component_sums["edge_coverage"] / total_images,
+                "train_edge_empty_masks": empty_masks,
+            }
+            self.logger.info("Training loss components: %s", self.last_train_components)
         return total_loss / total_images
 
     def validate(self, loader: DataLoader[Any], epoch: int) -> tuple[float, float]:
@@ -282,6 +383,9 @@ class Trainer:
         total_l1 = 0.0
         total_psnr = 0.0
         total_images = 0
+        total_ssim = total_edge_psnr = total_coverage = 0.0
+        edge_images = 0
+        per_image_rows: list[dict[str, Any]] = []
         with torch.inference_mode():
             for batch_index, batch in enumerate(loader, start=1):
                 lr = batch["lr"].to(self.device, non_blocking=True)
@@ -292,6 +396,29 @@ class Trainer:
                 per_image_psnr = rgb_psnr_per_image(output, hr)
                 total_l1 += per_image_l1.sum().item()
                 total_psnr += per_image_psnr.sum().item()
+                if self.edge_metric is not None:
+                    edges = self.edge_metric(output, hr)
+                    compute_ssim = self.ssim_schedule == "per_epoch"
+                    if compute_ssim:
+                        predictions = output.clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
+                        references = hr.permute(0, 2, 3, 1).cpu().numpy()
+                    for index in range(lr.shape[0]):
+                        ssim = rgb_ssim(predictions[index], references[index]) if compute_ssim else None
+                        valid = edges["pixels"][index].item() > 0
+                        edge_psnr = edges["psnr_db"][index].item() if valid else None
+                        coverage = edges["coverage"][index].item()
+                        if ssim is not None:
+                            total_ssim += ssim
+                        total_coverage += coverage
+                        if valid:
+                            total_edge_psnr += edge_psnr
+                            edge_images += 1
+                        per_image_rows.append({
+                            "key": batch["name"][index],
+                            "psnr_db": per_image_psnr[index].item(), "ssim": ssim,
+                            "edge_region_psnr_db": edge_psnr,
+                            "edge_pixels": edges["pixels"][index].item(), "edge_coverage": coverage,
+                        })
                 total_images += lr.shape[0]
                 if batch_index == 1 or batch_index % 60 == 0:
                     self.logger.info(
@@ -300,6 +427,25 @@ class Trainer:
                     )
         if total_images == 0:
             raise RuntimeError("Validation DataLoader produced no batches")
+        if self.edge_metric is not None:
+            mean_edge = total_edge_psnr / edge_images if edge_images else None
+            self.last_validation_details = {
+                "val_ssim": total_ssim / total_images if self.ssim_schedule == "per_epoch" else None,
+                "val_ssim_status": "per_epoch" if self.ssim_schedule == "per_epoch" else "deferred_post_selection",
+                "val_edge_region_psnr_db": mean_edge,
+                "val_edge_images": edge_images,
+                "val_edge_coverage": total_coverage / total_images,
+                "val_weighted_score": weighted_score(
+                    total_psnr / total_images, mean_edge, self.edge_protocol.weighted_alpha
+                ),
+            }
+            validation_dir = self.metric_dir / "validation"
+            validation_dir.mkdir(exist_ok=True)
+            with (validation_dir / f"epoch{epoch:03d}.csv").open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(per_image_rows[0]))
+                writer.writeheader()
+                writer.writerows(per_image_rows)
+            self.logger.info("Additional validation metrics: %s", self.last_validation_details)
         return total_l1 / total_images, total_psnr / total_images
 
     def _checkpoint_payload(self, epoch: int) -> dict[str, Any]:
@@ -317,6 +463,10 @@ class Trainer:
             "run_name": self.run_name,
             "validation_is_independent": self.validation_is_independent,
             "source_pretrained": str(self.pretrained_checkpoint),
+            "edge_validation_protocol": self.edge_protocol.definition() if self.edge_protocol.enabled else None,
+            "validation_fingerprint": self.validation_fingerprint,
+            "training_loss_protocol": self.loss_protocol.definition(self.edge_protocol),
+            "ssim_schedule": self.ssim_schedule,
         }
 
     def save_checkpoint(self, filename: str, epoch: int) -> Path:
@@ -329,10 +479,54 @@ class Trainer:
     def _write_metrics(self) -> Path:
         path = self.metric_dir / "metrics.csv"
         with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=self.CSV_FIELDS)
+            fields = self.CSV_FIELDS + (self.EDGE_CSV_FIELDS if self.edge_protocol.enabled else ())
+            if self.record_loss_components:
+                fields += self.LOSS_CSV_FIELDS
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(self.history)
         return path
+
+    def _save_selection_comparison(self, epoch: int) -> None:
+        """Retain every epoch so the global constrained selection remains exact."""
+        epoch_dir = self.checkpoint_dir / "epochs"
+        epoch_dir.mkdir(exist_ok=True)
+        self.save_checkpoint(f"epochs/epoch{epoch:03d}.pth", epoch)
+        choices = select_epochs(self.history, self.edge_protocol)
+        previous_path = self.metric_dir / "selection_summary.json"
+        previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.exists() else {}
+        selected: dict[str, Any] = {}
+        for strategy, row in choices.items():
+            selected_epoch = int(row["epoch"])
+            suffix = "" if self.validation_is_independent else "_self_check"
+            filename = f"best_{strategy}{suffix}.pth"
+            if (selected_epoch == epoch
+                    or previous.get("selected", {}).get(strategy, {}).get("epoch") != selected_epoch
+                    or not (self.checkpoint_dir / filename).exists()):
+                source = epoch_dir / f"epoch{selected_epoch:03d}.pth"
+                temporary = self.checkpoint_dir / (filename + ".tmp")
+                shutil.copyfile(source, temporary)
+                temporary.replace(self.checkpoint_dir / filename)
+            selected[strategy] = {**row, "checkpoint": str(self.checkpoint_dir / filename)}
+        best_psnr = max(float(row["val_psnr_db"]) for row in self.history)
+        summary = {
+            "completed_epoch": epoch,
+            "validation_is_independent": self.validation_is_independent,
+            "protocol": self.edge_protocol.definition(),
+            "best_val_psnr_db": best_psnr,
+            "constrained_psnr_floor_db": best_psnr - self.edge_protocol.psnr_tolerance_db,
+            "selected": selected,
+            "same_epoch_all_strategies": (
+                len({row["epoch"] for row in selected.values()}) == 1 if len(selected) == 3 else None
+            ),
+            "test_set_used": False,
+            "validation_fingerprint": self.validation_fingerprint,
+            "training_loss_protocol": self.loss_protocol.definition(self.edge_protocol),
+            "ssim_schedule": self.ssim_schedule,
+        }
+        temporary = previous_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(json_safe(summary), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(previous_path)
 
     def _save_validation_sample(self, loader: DataLoader[Any]) -> None:
         batch = next(iter(loader))
@@ -374,6 +568,11 @@ class Trainer:
                 f"Resume checkpoint is already at epoch {start_epoch}, but configured total "
                 f"epochs is {self.epochs}. Increase training.epochs or pass --epochs."
             )
+        if self.edge_protocol.enabled:
+            missing = [row["epoch"] for row in self.history
+                       if not (self.checkpoint_dir / "epochs" / f"epoch{int(row['epoch']):03d}.pth").is_file()]
+            if missing:
+                raise ValueError(f"Resume requires retained epoch checkpoints for exact selection; missing: {missing}")
 
         scope = "independent_validation" if self.validation_is_independent else "training_pair_self_check"
         self.logger.info(
@@ -400,11 +599,18 @@ class Trainer:
                 "epoch_seconds": elapsed,
                 "validation_scope": scope,
             }
+            if self.edge_protocol.enabled:
+                row.update(self.last_validation_details)
+                row["resumed_from_epoch"] = start_epoch if epoch == start_epoch + 1 else 0
+            if self.record_loss_components:
+                row.update(self.last_train_components)
             self.history.append(row)
 
             improved = val_psnr > self.best_val_psnr
             if improved:
                 self.best_val_psnr = val_psnr
+            if self.edge_protocol.enabled and self.save_best:
+                self._save_selection_comparison(epoch)
             last_path = self.save_checkpoint("last.pth", epoch)
             if improved and self.save_best:
                 best_name = "best.pth" if self.validation_is_independent else "best_self_check.pth"
@@ -414,7 +620,7 @@ class Trainer:
             if self.save_samples:
                 self._save_validation_sample(val_loader)
             self.logger.info(
-                "Epoch %d/%d | train L1 %.6f | val L1 %.6f | val PSNR %.3f dB | "
+                "Epoch %d/%d | train total %.6f | val L1 %.6f | val PSNR %.3f dB | "
                 "lr %.3g | %.2fs",
                 epoch,
                 self.epochs,
@@ -445,8 +651,9 @@ def verify_checkpoint_reload(
     checkpoint = _load_torch_file(path, trusted=False)
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError(f"Training checkpoint has no 'state_dict': {path}")
-    reloaded = build_quicksrnet_small_from_local_checkpoint(
-        pretrained_checkpoint, scale_factor=scale_factor
+    reloaded = build_quicksrnet_from_local_checkpoint(
+        pretrained_checkpoint, scale_factor=scale_factor,
+        model_name=checkpoint.get("config", {}).get("model", {}).get("name", "quicksrnet_small"),
     ).to(device)
     _backbone(reloaded).load_state_dict(checkpoint["state_dict"], strict=True)
     trained_model.eval()
