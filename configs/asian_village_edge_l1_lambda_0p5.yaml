@@ -1,0 +1,53 @@
+# QuickSRNet-Small 2x, 150 epochs with L1 + 0.5 * HR edge-region L1.
+project:
+  name: QuickSRNet-Gaming-Edge-L1-Lambda-0p5
+  scale_factor: 2
+model:
+  name: quicksrnet_small
+  scale_factor: 2
+  pretrained_checkpoint: checkpoints/pretrained/quicksrnet_small_2x_checkpoint_float32.pth.tar
+data:
+  train_lr: data/gaming/train/LR
+  train_hr: data/gaming/train/HR
+  val_lr: data/gaming/val/LR
+  val_hr: data/gaming/val/HR
+  scale_factor: 2
+  lr_patch_size: 128
+  rgb_range: [0.0, 1.0]
+  augment: true
+  num_workers: 4
+  pin_memory: true
+training:
+  epochs: 150
+  batch_size: 16
+  learning_rate: 0.0001
+  optimizer: adam
+  loss: l1_edge
+  edge_l1_weight: 0.5
+  amp: true
+validation:
+  ssim_schedule: post_selection
+  batch_size: 1
+  metric: psnr
+  save_best: true
+  save_samples: true
+  edge_evaluation:
+    enabled: true
+    sobel_threshold: 0.05
+    dilation_radius: 1
+    weighted_alpha: 0.3
+    psnr_tolerance_db: 0.1
+dryrun:
+  lr: data/dryrun/LR
+  hr: data/dryrun/HR
+  epochs: 3
+  batch_size: 1
+  lr_patch_size: 64
+  augment: true
+output:
+  checkpoint_dir: checkpoints/finetuned
+  log_dir: outputs/logs
+  metric_dir: outputs/metrics
+  sample_dir: outputs/samples
+device: cuda
+seed: 42
